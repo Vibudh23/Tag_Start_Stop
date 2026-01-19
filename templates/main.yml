@@ -1,1 +1,64 @@
 
+AWSTemplateFormatVersion: "2010-09-09"
+Description: EC2 Tag Start/Stop Scheduler - Enterprise IaC (Phase 1)
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: prod
+
+  ArtifactBucket:
+    Type: String
+    Description: S3 bucket containing Lambda zip files
+
+  TagSchedulerZipKey:
+    Type: String
+    Default: tag-scheduler.zip
+
+Resources:
+
+  SchedulerSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "ec2-scheduler-${EnvironmentName}-${AWS::Region}"
+
+  TagSchedulerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ec2-scheduler-lambda-role-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2Permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                Resource: "*"
+
+  TagSchedulerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "ec2-tag-scheduler-${EnvironmentName}"
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt TagSchedulerLambdaRole.Arn
+      Timeout: 120
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref TagSchedulerZipKey
+
+Outputs:
+  LambdaName:
+    Value: !Ref TagSchedulerLambda
