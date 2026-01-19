@@ -1,6 +1,5 @@
-
 AWSTemplateFormatVersion: "2010-09-09"
-Description: EC2 Tag Start/Stop Scheduler - Enterprise IaC (Phase 1)
+Description: EC2 Tag Start/Stop Scheduler (TagScheduler + StateChecker + StepFunctions + EventBridge + SNS) - Multi-region IaC
 
 Parameters:
   EnvironmentName:
@@ -9,34 +8,59 @@ Parameters:
 
   ArtifactBucket:
     Type: String
-    Description: S3 bucket containing Lambda zip files
+    Description: S3 bucket (in the same region) containing Lambda zip artifacts
 
   TagSchedulerZipKey:
     Type: String
-    Default: tag-scheduler.zip
+    Default: ec2-scheduler/tag-scheduler.zip
+
+  StateCheckerZipKey:
+    Type: String
+    Default: ec2-scheduler/state-checker.zip
+
+  TagKeyDefault:
+    Type: String
+    Default: RunSchedule
+
+  TagValueDefault:
+    Type: String
+    Default: OfficeHours-IST-8to5-MonFri
+
+  StartCronExpression:
+    Type: String
+    Default: cron(30 2 ? * MON-FRI *)  # 08:00 IST = 02:30 UTC
+
+  StopCronExpression:
+    Type: String
+    Default: cron(30 11 ? * MON-FRI *) # 17:00 IST = 11:30 UTC
+
+  WaitSeconds:
+    Type: Number
+    Default: 30
+    Description: Wait between start/stop and state verification
 
 Resources:
-
-  SchedulerSNSTopic:
+  # ---------------- SNS ----------------
+  SchedulerTopic:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: !Sub "ec2-scheduler-${EnvironmentName}-${AWS::Region}"
 
+  # ---------------- IAM: Lambda roles ----------------
   TagSchedulerLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "ec2-scheduler-lambda-role-${EnvironmentName}"
+      RoleName: !Sub "ec2-tag-scheduler-lambda-${EnvironmentName}-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
+            Principal: { Service: [lambda.amazonaws.com] }
+            Action: "sts:AssumeRole"
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
       Policies:
-        - PolicyName: EC2Permissions
+        - PolicyName: ec2-tag-scheduler-inline
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -47,18 +71,306 @@ Resources:
                   - ec2:StopInstances
                 Resource: "*"
 
+  StateCheckerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ec2-state-checker-lambda-${EnvironmentName}-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [lambda.amazonaws.com] }
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: ec2-state-checker-inline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                Resource: "*"
+
+  # ---------------- Lambdas ----------------
   TagSchedulerLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub "ec2-tag-scheduler-${EnvironmentName}"
+      FunctionName: !Sub "EC2-TagScheduler-${EnvironmentName}"
+      Role: !GetAtt TagSchedulerLambdaRole.Arn
       Runtime: python3.11
       Handler: lambda_function.lambda_handler
-      Role: !GetAtt TagSchedulerLambdaRole.Arn
       Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          TAG_KEY: !Ref TagKeyDefault
+          TAG_VALUE: !Ref TagValueDefault
       Code:
         S3Bucket: !Ref ArtifactBucket
         S3Key: !Ref TagSchedulerZipKey
 
+  StateCheckerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "EC2-StateChecker-${EnvironmentName}"
+      Role: !GetAtt StateCheckerLambdaRole.Arn
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref StateCheckerZipKey
+
+  # ---------------- IAM: Step Functions role ----------------
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ec2-scheduler-sfn-${EnvironmentName}-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [states.amazonaws.com] }
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: sfn-permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt TagSchedulerLambda.Arn
+                  - !GetAtt StateCheckerLambda.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref SchedulerTopic
+
+  # ---------------- Step Function (your definition, region-agnostic) ----------------
+  SchedulerStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "ec2-tag-scheduler-${EnvironmentName}"
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Tag based EC2 start/stop with verification, retries and SNS notification (enterprise safe)",
+          "StartAt": "Init",
+          "States": {
+            "Init": {
+              "Type": "Pass",
+              "Parameters": {
+                "attempt": 0,
+                "waitSeconds.$": "$.controls.waitSeconds",
+                "action.$": "$.action",
+                "desiredState.$": "$.desiredState",
+                "tagKey.$": "$.tagKey",
+                "tagValue.$": "$.tagValue",
+                "snsTopicArn.$": "$.snsTopicArn"
+              },
+              "ResultPath": "$",
+              "Next": "InvokeTagSchedulerLambda"
+            },
+            "InvokeTagSchedulerLambda": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${TagSchedulerLambda.Arn}",
+                "Payload": {
+                  "action.$": "$.action",
+                  "tagKey.$": "$.tagKey",
+                  "tagValue.$": "$.tagValue"
+                }
+              },
+              "ResultPath": "$.lambdaResult",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 5,
+                  "BackoffRate": 2,
+                  "MaxAttempts": 3
+                }
+              ],
+              "Next": "NoInstances?"
+            },
+            "NoInstances?": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.lambdaResult.Payload.instanceIds[0]",
+                  "IsPresent": false,
+                  "Next": "PublishNoTargets"
+                }
+              ],
+              "Default": "WaitBeforeCheck"
+            },
+            "WaitBeforeCheck": {
+              "Type": "Wait",
+              "SecondsPath": "$.waitSeconds",
+              "Next": "CheckDesiredState"
+            },
+            "CheckDesiredState": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${StateCheckerLambda.Arn}",
+                "Payload": {
+                  "instanceIds.$": "$.lambdaResult.Payload.instanceIds",
+                  "desiredState.$": "$.desiredState"
+                }
+              },
+              "ResultPath": "$.stateCheck",
+              "Next": "ReachedDesired?"
+            },
+            "ReachedDesired?": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.stateCheck.Payload.allOk",
+                  "BooleanEquals": true,
+                  "Next": "PublishSuccess"
+                }
+              ],
+              "Default": "IncrementAttempt"
+            },
+            "IncrementAttempt": {
+              "Type": "Pass",
+              "Parameters": {
+                "attempt.$": "States.MathAdd($.attempt, 1)",
+                "waitSeconds.$": "$.waitSeconds",
+                "action.$": "$.action",
+                "desiredState.$": "$.desiredState",
+                "tagKey.$": "$.tagKey",
+                "tagValue.$": "$.tagValue",
+                "snsTopicArn.$": "$.snsTopicArn",
+                "lambdaResult.$": "$.lambdaResult",
+                "stateCheck.$": "$.stateCheck"
+              },
+              "ResultPath": "$",
+              "Next": "AttemptsExceeded?"
+            },
+            "AttemptsExceeded?": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.attempt",
+                  "NumericGreaterThanEquals": 10,
+                  "Next": "PublishFailure"
+                }
+              ],
+              "Default": "WaitBeforeCheck"
+            },
+            "PublishSuccess": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::sns:publish",
+              "Parameters": {
+                "TopicArn.$": "$.snsTopicArn",
+                "Message.$": "States.Format('SUCCESS | Action={} | DesiredState={} | Tag={}={} | Instances={} | States={}', $.action, $.desiredState, $.tagKey, $.tagValue, $.lambdaResult.Payload.instanceIds, $.stateCheck.Payload.states)"
+              },
+              "Next": "Done"
+            },
+            "PublishFailure": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::sns:publish",
+              "Parameters": {
+                "TopicArn.$": "$.snsTopicArn",
+                "Message.$": "States.Format('FAILED | Action={} | DesiredState={} | Tag={}={} | Attempts={} | Instances={} | LastStates={}', $.action, $.desiredState, $.tagKey, $.tagValue, $.attempt, $.lambdaResult.Payload.instanceIds, $.stateCheck.Payload.states)"
+              },
+              "Next": "FailState"
+            },
+            "PublishNoTargets": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::sns:publish",
+              "Parameters": {
+                "TopicArn.$": "$.snsTopicArn",
+                "Message.$": "States.Format('NO TARGETS | Action={} | Tag={}={} | Note=No instances matched the tag filter', $.action, $.tagKey, $.tagValue)"
+              },
+              "Next": "Done"
+            },
+            "Done": { "Type": "Succeed" },
+            "FailState": {
+              "Type": "Fail",
+              "Error": "InstanceStateNotReached",
+              "Cause": "Retries exhausted"
+            }
+          }
+        }
+
+  # ---------------- IAM: EventBridge -> Step Functions ----------------
+  EventBridgeInvokeSfnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "events-invoke-sfn-${EnvironmentName}-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [events.amazonaws.com] }
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: allow-start-execution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref SchedulerStateMachine
+
+  # ---------------- EventBridge schedules (Mon-Fri, 8AM IST start, 5PM IST stop) ----------------
+  StartScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "ec2-scheduler-start-${EnvironmentName}-${AWS::Region}"
+      ScheduleExpression: !Ref StartCronExpression
+      State: ENABLED
+      Targets:
+        - Arn: !Ref SchedulerStateMachine
+          Id: "StartExecution"
+          RoleArn: !GetAtt EventBridgeInvokeSfnRole.Arn
+          Input: !Sub |
+            {
+              "action": "start",
+              "desiredState": "running",
+              "tagKey": "${TagKeyDefault}",
+              "tagValue": "${TagValueDefault}",
+              "snsTopicArn": "${SchedulerTopic}",
+              "controls": { "waitSeconds": ${WaitSeconds} }
+            }
+
+  StopScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "ec2-scheduler-stop-${EnvironmentName}-${AWS::Region}"
+      ScheduleExpression: !Ref StopCronExpression
+      State: ENABLED
+      Targets:
+        - Arn: !Ref SchedulerStateMachine
+          Id: "StopExecution"
+          RoleArn: !GetAtt EventBridgeInvokeSfnRole.Arn
+          Input: !Sub |
+            {
+              "action": "stop",
+              "desiredState": "stopped",
+              "tagKey": "${TagKeyDefault}",
+              "tagValue": "${TagValueDefault}",
+              "snsTopicArn": "${SchedulerTopic}",
+              "controls": { "waitSeconds": ${WaitSeconds} }
+            }
+
 Outputs:
-  LambdaName:
-    Value: !Ref TagSchedulerLambda
+  SnsTopicArn:
+    Value: !Ref SchedulerTopic
+  StateMachineArn:
+    Value: !Ref SchedulerStateMachine
+  TagSchedulerLambdaArn:
+    Value: !GetAtt TagSchedulerLambda.Arn
+  StateCheckerLambdaArn:
+    Value: !GetAtt StateCheckerLambda.Arn
